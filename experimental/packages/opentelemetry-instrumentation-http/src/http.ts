@@ -34,7 +34,7 @@ import {
 import type * as http from 'http';
 import type * as https from 'https';
 import type { Socket } from 'net';
-import * as url from 'url';
+import type * as url from 'url';
 import type { HttpInstrumentationConfig } from './types';
 import { VERSION } from './version';
 import {
@@ -64,6 +64,7 @@ import {
   getOutgoingRequestAttributesOnResponse,
   getOutgoingStableRequestMetricAttributesOnResponse,
   getRequestInfo,
+  isURLLike,
   headerCapture,
   isValidOptionsType,
   parseResponseStatus,
@@ -798,7 +799,7 @@ export class HttpInstrumentation extends InstrumentationBase<HttpInstrumentation
       }
       const extraOptions =
         typeof args[0] === 'object' &&
-        (typeof options === 'string' || options instanceof url.URL)
+        (typeof options === 'string' || isURLLike(options))
           ? (args.shift() as http.RequestOptions)
           : undefined;
       const { method, invalidUrl, optionsParsed } = getRequestInfo(

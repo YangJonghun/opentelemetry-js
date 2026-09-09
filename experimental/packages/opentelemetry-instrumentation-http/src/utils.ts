@@ -42,7 +42,7 @@ import type {
 } from 'http';
 import { isIPv6 } from 'net';
 import { getRPCMetadata, RPCType } from '@opentelemetry/core';
-import * as url from 'url';
+import type * as url from 'url';
 import type {
   Err,
   IgnoreMatcher,
@@ -88,9 +88,16 @@ export const getAbsoluteUrl = (
   const protocol = reqUrlObject.protocol || fallbackProtocol;
   const port = (reqUrlObject.port || '').toString();
   let path = reqUrlObject.path || '/';
-  let host = String(
-    reqUrlObject.host || reqUrlObject.hostname || headers.host || 'localhost'
-  );
+  // `host`, `hostname` and the `host` header may hold values of unexpected
+  // types at runtime. Node.js itself ignores non-string values when it can
+  // derive the target from another option (e.g. it uses `hostname` when
+  // `host` is not a valid string), so skip non-string candidates instead of
+  // crashing on them.
+  let host: string =
+    (typeof reqUrlObject.host === 'string' && reqUrlObject.host) ||
+    (typeof reqUrlObject.hostname === 'string' && reqUrlObject.hostname) ||
+    (typeof headers.host === 'string' && headers.host) ||
+    'localhost';
   let hostHasPort = false;
   if (isIPv6(host)) {
     host = `[${host}]`;
@@ -108,7 +115,8 @@ export const getAbsoluteUrl = (
   if (!hostHasPort && port && !isDefaultPort) {
     host += `:${port}`;
   }
-  if (path.includes('?')) {
+  // Redact sensitive query parameters
+  if (typeof path === 'string' && path.includes('?')) {
     try {
       const parsedUrl = new URL(path, 'http://localhost');
       const redacted = redactQueryString(
@@ -241,6 +249,30 @@ function stringUrlToHttpOptions(
 }
 
 /**
+ * Mirrors how Node.js detects WHATWG `URL` objects passed to `http.request`
+ * and `https.request`: by shape rather than by `instanceof`, so that URL
+ * objects from other realms (e.g. `vm` contexts) or WHATWG URL polyfills are
+ * handled the same way Node.js handles them.
+ *
+ * This mirrors Node's `isURL()` predicate exactly. The `auth`/`path` guards
+ * matter: they keep options objects and legacy `url.parse()` results (both
+ * carry `path`) off the URL code path.
+ *
+ * See https://github.com/nodejs/node/blob/2505e217bba05fc581b572c685c5cf280a16c5a3/lib/internal/url.js#L756-L773
+ */
+export const isURLLike = (value: unknown): value is url.URL => {
+  const candidate = value as
+    | (url.URL & { auth?: unknown; path?: unknown })
+    | undefined;
+  return Boolean(
+    candidate?.href &&
+      candidate.protocol &&
+      candidate.auth === undefined &&
+      candidate.path === undefined
+  );
+};
+
+/**
  * Makes sure options is an url object
  * return an object with default value and parsed options
  * @param logger component logger
@@ -284,7 +316,7 @@ export const getRequestInfo = (
     if (extraOptions !== undefined) {
       Object.assign(optionsParsed, extraOptions);
     }
-  } else if (options instanceof url.URL) {
+  } else if (isURLLike(options)) {
     optionsParsed = {
       protocol: options.protocol,
       hostname:
@@ -330,9 +362,12 @@ export const getRequestInfo = (
 
   // some packages return method in lowercase..
   // ensure upperCase for consistency
-  const method = optionsParsed.method
-    ? optionsParsed.method.toUpperCase()
-    : 'GET';
+  // Note: a non-string `method` is rejected by Node.js itself; skip it here
+  // so the resulting error comes from Node.js and not the instrumentation.
+  const method =
+    optionsParsed.method && typeof optionsParsed.method === 'string'
+      ? optionsParsed.method.toUpperCase()
+      : 'GET';
 
   return { origin, pathname, method, optionsParsed, invalidUrl };
 };
@@ -356,35 +391,48 @@ export const extractHostnameAndPort = (
     'hostname' | 'host' | 'port' | 'protocol'
   >
 ): { hostname: string; port: number | string } => {
-  if (requestOptions.hostname && requestOptions.port) {
-    return { hostname: requestOptions.hostname, port: requestOptions.port };
+  // `hostname`, `host` and `port` may hold values of unexpected types at
+  // runtime. Node.js itself ignores non-string values when it can derive the
+  // target from another option (e.g. it uses `hostname` when `host` is not a
+  // valid string), so skip non-string candidates instead of crashing on them.
+  const optionsHostname =
+    typeof requestOptions.hostname === 'string'
+      ? requestOptions.hostname
+      : undefined;
+  const optionsHost =
+    typeof requestOptions.host === 'string' ? requestOptions.host : undefined;
+  const optionsPort =
+    typeof requestOptions.port === 'string' ||
+    typeof requestOptions.port === 'number'
+      ? requestOptions.port
+      : undefined;
+
+  if (optionsHostname && optionsPort) {
+    return { hostname: optionsHostname, port: optionsPort };
   }
-  if (!requestOptions.hostname && requestOptions.host) {
-    if (isIPv6(requestOptions.host)) {
+  if (!optionsHostname && optionsHost) {
+    if (isIPv6(optionsHost)) {
       return {
-        hostname: requestOptions.host,
+        hostname: optionsHost,
         port:
-          requestOptions.port ||
-          (requestOptions.protocol === 'https:' ? '443' : '80'),
+          optionsPort || (requestOptions.protocol === 'https:' ? '443' : '80'),
       };
     }
-    const bracketedHost = /^\[([^\]]+)\](?::(\d{1,5}))?$/.exec(
-      requestOptions.host
-    );
+    const bracketedHost = /^\[([^\]]+)\](?::(\d{1,5}))?$/.exec(optionsHost);
     if (bracketedHost && isIPv6(bracketedHost[1])) {
       return {
         hostname: bracketedHost[1],
         port:
-          requestOptions.port ||
+          optionsPort ||
           bracketedHost[2] ||
           (requestOptions.protocol === 'https:' ? '443' : '80'),
       };
     }
   }
-  const matches = requestOptions.host?.match(/^([^:/ ]+)(:\d{1,5})?/) || null;
+  const matches = optionsHost?.match(/^([^:/ ]+)(:\d{1,5})?/) || null;
   const hostname =
-    requestOptions.hostname || (matches === null ? 'localhost' : matches[1]);
-  let port = requestOptions.port;
+    optionsHostname || (matches === null ? 'localhost' : matches[1]);
+  let port = optionsPort;
   if (!port) {
     if (matches && matches[2]) {
       // remove the leading ":". The extracted port would be something like ":8080"
