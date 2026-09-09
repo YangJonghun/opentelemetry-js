@@ -267,6 +267,47 @@ describe('FetchTransport', function () {
       });
     });
 
+    it('keeps tracing suppressed when a third-party wrapper hides an instrumented fetch', async function () {
+      context.setGlobalContextManager(new TestStackContextManager());
+
+      const nativeFetch = sinon
+        .stub()
+        .resolves(new Response('', { status: 200 }));
+      let suppressedDuringInstrumentedFetch: boolean | undefined;
+      const instrumentedFetch = sinon
+        .stub()
+        .callsFake(
+          (...args: Parameters<typeof fetch>): ReturnType<typeof fetch> => {
+            suppressedDuringInstrumentedFetch = isTracingSuppressed(
+              context.active()
+            );
+            return nativeFetch(...args);
+          }
+        );
+      (
+        instrumentedFetch as unknown as { __original: typeof fetch }
+      ).__original = nativeFetch as unknown as typeof fetch;
+
+      // Simulate a third-party wrapper installed after the instrumentation.
+      // It calls the instrumented fetch but does not expose `__original`.
+      sinon.stub(globalThis, 'fetch').callsFake((...args) => {
+        return instrumentedFetch(...args);
+      });
+
+      const transport = createFetchTransport(testTransportParameters);
+      const response = await context.with(
+        suppressTracing(context.active()),
+        () => transport.send(testPayload, requestTimeout)
+      );
+
+      assert.strictEqual(response.status, 'success');
+      assert.strictEqual(
+        suppressedDuringInstrumentedFetch,
+        true,
+        'the hidden instrumentation wrapper must observe suppressed tracing'
+      );
+    });
+
     it('carries the caller context into the fetch call', function (done) {
       context.setGlobalContextManager(new TestStackContextManager());
 
